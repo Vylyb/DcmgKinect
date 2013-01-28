@@ -6,11 +6,23 @@
 *******************************************************************************/
 
 #include <GL/glut.h>
+#include <stdio.h>			// Header File For Standard Input/Output
+#include <gl/glu.h>			// Header File For The GLu32 Library
+#include <windows.h>
+#include <fstream>
+#include <string.h>
+
+#include "lodepng.h"
+
 #include "Viewer.h"
 
 #define GL_WIN_SIZE_X	1280
 #define GL_WIN_SIZE_Y	1024
 #define TEXTURE_SIZE	512
+
+#define MAX_USERS 1
+
+#define MAX_LINE_LENGTH 1000
 
 #define DEFAULT_DISPLAY_MODE	DISPLAY_MODE_DEPTH
 
@@ -26,22 +38,140 @@ bool g_drawBoundingBox = false;
 bool g_drawBackground = false;
 bool g_drawDepth = true;
 bool g_drawFrameId = false;
+bool g_fullScreen = true;
 
 /*
-	String zur Ausgabe der Position des Betrachters
+	String zur Ausgabe der Position der Betrachter
 */
 char msgBuffer[100];
 
 /*
-	Speichert die Position des Betrachters
+	Speichert die Positionen der Betrachter im Raum
 */
 int personCenter;
 int personDistance;
+float xOnScreen,yOnScreen;
+
+/*
+	Speichert den jeweils letzten Wert von xValue, wenn der zwischen 0 und Fensterbreite liegt.
+*/
+int imageBorder;
+
+/*
+	Speichert den Index des neuesten Betrachters.
+	Wird ein neuer Betrachter erkannt, verliert der aktuelle den Fokus und der neue Betrachter wird hier gespeichert.
+	Die Bildgrenze folgt dann dem neuen Betrachter.
+
+	Wenn der aktuelle Betrachter verloren wurde, läuft die Bildgrenze automatisch ab.
+	Dann wird -1 gespeichert.
+*/
+nite::UserId latestUserID=-1;
+
+nite::UserData latestUser;
+
+/*
+	Speichert, ob ein Besucher getrackt wird oder nicht
+*/
+bool trackLatestUser=false;
+
+/*
+	Speichert die X-Positionen aller User
+*/
+typedef struct UuserPosition{
+	unsigned int xPos;
+	nite::UserId id;
+} UserPosition;
+std::vector<UserPosition> userPositions;
+
+/*
+	Speichert die Position der Kinect
+	false => Kinect steht vor dem Betrachter
+	true => Kinect steht hinter dem Betrachter
+*/
+bool mirrored=false;
+
+nite::UserTrackerFrameRef userTrackerFrame;
+
+
+/*
+	Speichert die dargestellten Bilder
+*/
+typedef struct pngImage{
+	std::vector<unsigned char> img;
+	int width,height;
+} PNGImage;
+
+typedef struct imagePair{
+	PNGImage original, overlay;
+} ImagePair;
+std::vector<ImagePair> imagePairs;
+
+/*
+	Speichert den Index des aktuellen Bildpaares
+*/
+int imagePairID;
 
 int g_nXRes = 0, g_nYRes = 0;
 
 // time to hold in pose to exit program. In milliseconds.
 const int g_poseTimeoutToExit = 100;
+
+int loadPNGImage(char* filename,PNGImage& target)
+{
+	printf("Lade Bild %s\n",filename);
+
+	PNGImage loadedImage;
+
+	std::vector<unsigned char> image;
+	unsigned int width, height;
+	unsigned int error = lodepng::decode(image, width, height, filename);
+
+	if(error!=0)	//Fehler beim Laden
+	{
+		printf("Fehler beim Laden von %s, Error: %d\n",filename,error);
+		return error;
+	}
+	// Texture size must be power of two for the primitive OpenGL version this is written for. Find next power of two.
+	size_t u2 = 1; 
+	while(u2 < width) 
+		u2 *= 2;
+	size_t v2 = 1; 
+	while(v2 < height) 
+		v2 *= 2;
+	// Ratio for power of two version compared to actual version, to render the non power of two image with proper size.
+	double u3 = (double)width / u2;
+	double v3 = (double)height / v2;
+
+	// Make power of two version of the image.
+	std::vector<unsigned char> image2(u2 * v2 * 4);
+	for(size_t y = 0; y < height; y++)
+		for(size_t x = 0; x < width; x++)
+			for(size_t c = 0; c < 4; c++)
+			{
+				image2[4 * u2 * y + 4 * x + c] = image[4 * width * y + 4 * x + c];
+			}
+
+	target.img=image2;
+	target.width=u2;
+	target.height=v2;
+
+	printf("Bild wurde geladen\n\tBreite: %d\tHoehe: %d\n",target.width,target.height);
+
+	return 0;
+
+}
+
+int loadImagePair(char* filename1,char* filename2)
+{
+	ImagePair pair;
+	if(	loadPNGImage(filename1,pair.original)==0 &&
+		loadPNGImage(filename2,pair.overlay)==0) 
+	{
+		imagePairs.push_back(pair);
+		return 0;
+	}
+	return 1;
+}
 
 void SampleViewer::glutIdle()
 {
@@ -116,6 +246,55 @@ openni::Status SampleViewer::Init(int argc, char **argv)
 		return openni::STATUS_ERROR;
 	}
 
+	/*
+		mirrored?
+	*/
+	if(argc==2){
+		if(strcmp(argv[1],"mirror")==0){
+			mirrored=true;
+		}
+	}
+
+	/*
+		Einstellungsdatei laden (Parameter 1)
+		Bilddateien laden
+	*/
+	std::vector<std::string> config;
+
+	std::ifstream ifs(argv[1]);
+	std::string temp;
+
+	printf("Loading Config: %s\n",argv[1]);
+	while(std::getline(ifs,temp))
+	{
+		config.push_back(temp);
+	}
+
+	char *filename1=(char*)malloc(MAX_LINE_LENGTH),*filename2=(char*)malloc(MAX_LINE_LENGTH),*temp2=(char*)malloc(MAX_LINE_LENGTH);
+	for(int i=0;i<config.size();i++)
+	{
+
+		printf("\tAnalyzing line %d: '%s'\n",i+1,config.at(i));
+		/*
+			Config-Zeilen analysieren
+		*/
+		int k;
+		for(k=0;k<config.at(i).size();k++)
+		{
+			temp2[k]=(char)config.at(i)[k];
+		}
+		temp2[k]='\0';
+		// analysiere Bildpaare
+		sscanf(temp2,"pair %s %s",filename1,filename2);
+
+		if(loadImagePair(filename1,filename2)==0)
+		{
+			printf("Image Pair loaded:\n\t%s\n\t%s\n\t=>%d pairs\n\n",filename1,filename2,imagePairs.size());
+		}
+
+	}
+
+	imagePairID=0;
 
 	return InitOpenGL(argc, argv);
 
@@ -128,10 +307,9 @@ openni::Status SampleViewer::Run()	//Does not return
 	return openni::STATUS_OK;
 }
 
+int colorCount = MAX_USERS;
 float Colors[][3] = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {1, 1, 1}};
-int colorCount = 3;
 
-#define MAX_USERS 3
 bool g_visibleUsers[MAX_USERS] = {false};
 nite::SkeletonState g_skeletonStates[MAX_USERS] = {nite::SKELETON_NONE};
 char g_userStatusLabels[MAX_USERS][100] = {{0}};
@@ -145,6 +323,7 @@ char g_generalMessage[100] = {0};
 
 void updateUserState(const nite::UserData& user, uint64_t ts)
 {
+
 	if (user.isNew())
 	{
 		USER_MESSAGE("New");
@@ -165,13 +344,17 @@ void updateUserState(const nite::UserData& user, uint64_t ts)
 		switch(g_skeletonStates[user.getId()] = user.getSkeleton().getState())
 		{
 		case nite::SKELETON_NONE:
-			USER_MESSAGE("Stopped tracking.")
-			break;
-		case nite::SKELETON_CALIBRATING:
-			USER_MESSAGE("Calibrating...")
+			{
+//				USER_MESSAGE("Stopped tracking.");
+				latestUserID=-1;
+			}
 			break;
 		case nite::SKELETON_TRACKED:
-			USER_MESSAGE("Tracking!")
+			{
+//				USER_MESSAGE("Tracking!");
+				if(latestUserID==-1)
+					latestUserID=user.getId();
+			}
 			break;
 		case nite::SKELETON_CALIBRATION_ERROR_NOT_IN_POSE:
 		case nite::SKELETON_CALIBRATION_ERROR_HANDS:
@@ -179,6 +362,8 @@ void updateUserState(const nite::UserData& user, uint64_t ts)
 		case nite::SKELETON_CALIBRATION_ERROR_HEAD:
 		case nite::SKELETON_CALIBRATION_ERROR_TORSO:
 			USER_MESSAGE("Calibration Failed... :-|")
+			break;
+		case nite::SKELETON_CALIBRATING:
 			break;
 		}
 	}
@@ -195,6 +380,14 @@ void glPrintString(void *font, const char *str)
 	}   
 }
 #endif
+
+void printUserInfo(int y,int color,char* msg)
+{
+	glColor3f(1,1,1);
+	glRasterPos2i(40,y);
+	glPrintString(GLUT_BITMAP_TIMES_ROMAN_24, msg);
+}
+
 
 void DrawStatusLabel(nite::UserTracker* pUserTracker, const nite::UserData& user)
 {
@@ -312,9 +505,9 @@ void DrawLimb(nite::UserTracker* pUserTracker, const nite::SkeletonJoint& joint1
 	glDrawArrays(GL_POINTS, 0, 1);
 }
 
-void DrawSkeleton(nite::UserTracker* pUserTracker, const nite::UserData& userData)
+void DrawSkeleton(nite::UserTracker* pUserTracker, const nite::UserData& userData, int y)
 {
-	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_HEAD), userData.getSkeleton().getJoint(nite::JOINT_NECK), userData.getId() % colorCount);
+/*	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_HEAD), userData.getSkeleton().getJoint(nite::JOINT_NECK), userData.getId() % colorCount);
 
 	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_LEFT_SHOULDER), userData.getSkeleton().getJoint(nite::JOINT_LEFT_ELBOW), userData.getId() % colorCount);
 	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_LEFT_ELBOW), userData.getSkeleton().getJoint(nite::JOINT_LEFT_HAND), userData.getId() % colorCount);
@@ -329,81 +522,120 @@ void DrawSkeleton(nite::UserTracker* pUserTracker, const nite::UserData& userDat
 
 	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_TORSO), userData.getSkeleton().getJoint(nite::JOINT_LEFT_HIP), userData.getId() % colorCount);
 	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_TORSO), userData.getSkeleton().getJoint(nite::JOINT_RIGHT_HIP), userData.getId() % colorCount);
+*/
+	////////
+	const nite::SkeletonJoint joint = userData.getSkeleton().getJoint(nite::JOINT_HEAD);
 
-	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_LEFT_HIP), userData.getSkeleton().getJoint(nite::JOINT_RIGHT_HIP), userData.getId() % colorCount);
+	pUserTracker->convertJointCoordinatesToDepth(
+		joint.getPosition().x,
+		joint.getPosition().y,
+		joint.getPosition().z,
+		&xOnScreen, 
+		&yOnScreen);
 
+	imageBorder = xOnScreen * (GL_WIN_SIZE_X / g_nXRes);
+	if(imageBorder < 0)
+		imageBorder = 0;
+	if(imageBorder > GL_WIN_SIZE_X)
+		imageBorder = GL_WIN_SIZE_X;
 
-	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_LEFT_HIP), userData.getSkeleton().getJoint(nite::JOINT_LEFT_KNEE), userData.getId() % colorCount);
-	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_LEFT_KNEE), userData.getSkeleton().getJoint(nite::JOINT_LEFT_FOOT), userData.getId() % colorCount);
+	sprintf(msgBuffer,"Tracking User %d | xPos: %d",userData.getId(),imageBorder);
+	printUserInfo(y, 0, msgBuffer);
 
-	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_RIGHT_HIP), userData.getSkeleton().getJoint(nite::JOINT_RIGHT_KNEE), userData.getId() % colorCount);
-	DrawLimb(pUserTracker, userData.getSkeleton().getJoint(nite::JOINT_RIGHT_KNEE), userData.getSkeleton().getJoint(nite::JOINT_RIGHT_FOOT), userData.getId() % colorCount);
 }
-
-
-/////////////////////
 
 
 /*
-	Betrachter tracken
-	Kopf dient als Körpermitte
+	PRE: left <= value <= right
 */
-void TrackUser(nite::UserTracker* pUserTracker, const nite::UserData& userData,int id,int countUsers)
-{
-	/*
-		Körpermitte auslesen
-	*/
-	personCenter = userData.getCenterOfMass().x;
-	personDistance = userData.getCenterOfMass().z;
-
-	/*
-		Position ausgeben
-	*/
-	sprintf(msgBuffer,"Position des Betrachters (%d von %d) | X: %d | Dist: %d",id,countUsers,personCenter,personDistance);
-
-	int color = (id-1) % colorCount;
-	glColor3f(1.0f - Colors[color][0], 1.0f - Colors[color][1], 1.0f - Colors[color][2]);
-	glRasterPos2i(40,20+(id*20));
-	glPrintString(GLUT_BITMAP_TIMES_ROMAN_24, msgBuffer);
-
-	/*
-		Verhältnis zwischen Entfernung und Position bestimmen
-		
-  		  | -
-  		  |    -
-  		  |       -
-  		  |          -
-  		  |             -
-  		  |                -
-  		  |                   -
-  		  |                      -   <-- Kegel des Beamers
-  		  |                         -
-  		  |                         #  -   ###  
-		  |                         #    II###
-  		  |                         #  -   ###
-  		  |						    -
-  		  |                      -
-  		  |                   -
-  		  |                -
-  		  |             -
-  		  |          -
-  		  |       -
-  		  |    -
-  		  | -
-
-	Wand
-
-
-	*/
+int getNearestIndex(int left,int right,int value){
+	if(right-value>value-left)
+		return 1;
+	return 0;
 }
 
+void TrackUser(nite::UserTracker* pUserTracker, const nite::UserData& user)
+{
+	const nite::SkeletonJoint joint = user.getSkeleton().getJoint(nite::JOINT_HEAD);
+
+	pUserTracker->convertJointCoordinatesToDepth(
+		joint.getPosition().x,
+		joint.getPosition().y,
+		joint.getPosition().z,
+		&xOnScreen, 
+		&yOnScreen);
+
+	imageBorder = xOnScreen * (GL_WIN_SIZE_X / g_nXRes);
+	if(imageBorder < 0)
+		imageBorder = 0;
+	if(imageBorder > GL_WIN_SIZE_X)
+		imageBorder = GL_WIN_SIZE_X;
+}
+
+void TrackLatestUser(nite::UserTracker* pUserTracker)
+{
+		
+//	const nite::UserData user = userTrackerFrame.getUserById(latestUserID);
+
+	pUserTracker->convertJointCoordinatesToDepth(
+		latestUser.getCenterOfMass().x, 
+		latestUser.getCenterOfMass().y, 
+		latestUser.getCenterOfMass().z, 
+		&xOnScreen, 
+		&yOnScreen);
+
+	int xValue = xOnScreen * (GL_WIN_SIZE_X / g_nXRes);
+
+	if(xValue>0 && xValue<=GL_WIN_SIZE_X)
+	{
+		imageBorder=xValue;
+	}
+
+}
+
+void drawImage(PNGImage img)
+{
+	/*
+		Bilder zeichnen
+	*/
+	glEnable(GL_TEXTURE_2D);
+	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); //GL_NEAREST = no smoothing
+	glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	glTexImage2D(
+		GL_TEXTURE_2D,			//targte
+		0,						//level
+		4,						//internal format
+		img.width,						//breite 
+		img.height,						//hoehe
+		0,						//border
+		GL_RGBA,					//format
+		GL_UNSIGNED_BYTE,		//typ
+		&img.img[0]				//zeiger auf pixel
+	);
+
+	glEnable(GL_TEXTURE_2D);
+    glBegin(GL_QUADS);
+      glTexCoord2f( 0.0f, 0.0f); 
+	  glVertex2f( 0, 0);
+      
+	  glTexCoord2f( 1.0f, 0.0f); 
+	  glVertex2f( img.width, 0);
+      
+	  glTexCoord2f( 1.0f, 1.0f); 
+	  glVertex2f( img.width, img.height);
+      
+	  glTexCoord2f( 0.0f, 1.0f); 
+	  glVertex2f( 0, img.height);
+    glEnd();
+
+	glDisable(GL_TEXTURE_2D);
+}
 
 ////////////////////////////
 
 
 void SampleViewer::Display()
 {
-	nite::UserTrackerFrameRef userTrackerFrame;
 	openni::VideoFrameRef depthFrame;
 	nite::Status rc = m_pUserTracker->readFrame(&userTrackerFrame);
 	if (rc != nite::STATUS_OK)
@@ -411,6 +643,25 @@ void SampleViewer::Display()
 		printf("GetNextData failed\n");
 		return;
 	}
+
+	glClear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+	glMatrixMode(GL_PROJECTION_MATRIX);
+	glPushMatrix();
+	glLoadIdentity();
+	glOrtho(0, GL_WIN_SIZE_X, GL_WIN_SIZE_Y, 0, -1.0, 1.0);
+
+	/*
+		Originalbild zeichnen
+	*/
+	drawImage(imagePairs.at(imagePairID).original);
+
+	depthFrame = userTrackerFrame.getDepthFrame();
+	g_nXRes = depthFrame.getVideoMode().getResolutionX();
+	g_nYRes = depthFrame.getVideoMode().getResolutionY();
+	
+	/*
+		glColor4f(1,1,1,1);
 
 	depthFrame = userTrackerFrame.getDepthFrame();
 
@@ -423,13 +674,6 @@ void SampleViewer::Display()
 	}
 
 	const nite::UserMap& userLabels = userTrackerFrame.getUserMap();
-
-	glClear (GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-
-	glMatrixMode(GL_PROJECTION);
-	glPushMatrix();
-	glLoadIdentity();
-	glOrtho(0, GL_WIN_SIZE_X, GL_WIN_SIZE_Y, 0, -1.0, 1.0);
 
 	if (depthFrame.isValid() && g_drawDepth)
 	{
@@ -526,7 +770,11 @@ void SampleViewer::Display()
 			pTexRow += m_nTexMapX;
 		}
 	}
+*/
 
+		////////////////
+
+	/*
 	glTexParameteri(GL_TEXTURE_2D, GL_GENERATE_MIPMAP_SGIS, GL_TRUE);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
@@ -556,20 +804,28 @@ void SampleViewer::Display()
 
 	glEnd();
 	glDisable(GL_TEXTURE_2D);
-
-	const nite::Array<nite::UserData>& users = userTrackerFrame.getUsers();
-	/*
-		erkannte user tracken
 	*/
+
+//	drawImage(images.at(0));
+
+	const nite::UserMap& userLabels = userTrackerFrame.getUserMap();
+	const nite::Array<nite::UserData>& users = userTrackerFrame.getUsers();
+
+	/*
+		alle erkannte user analysieren.
+		ist ein user neu, wird er gespeichert.
+		Dieser User wird ab sofort getrackt und die Bildgrenze folgt ihm
+	*/
+
 	for (int i = 0; i < users.getSize(); ++i)
 	{
 		const nite::UserData& user = users[i];
 
 		updateUserState(user, userTrackerFrame.getTimestamp());
-		if (user.isNew())
+		
+		if(user.isNew())
 		{
 			m_pUserTracker->startSkeletonTracking(user.getId());
-			m_pUserTracker->startPoseDetection(user.getId(), nite::POSE_CROSSED_HANDS);
 		}
 		else if (!user.isLost())
 		{
@@ -577,65 +833,73 @@ void SampleViewer::Display()
 				Skelett aufrufen
 				analysieren
 			*/
-			if (users[i].getSkeleton().getState() == nite::SKELETON_TRACKED && g_drawSkeleton)
+			if(user.getId() == latestUserID)
 			{
-				/*
-					Körpermitte zeichnen
-				*/
-				DrawCenterOfMass(m_pUserTracker, user);
-			
-				/*
-					Betrachter verfolgen
-
-					Positionen der Betrachter werden hier bestimmt und entsprechend umgesetzt.
-				*/
-				TrackUser(m_pUserTracker, user, i+1, users.getSize());
-			}
-		}
-
-		if (m_poseUser == 0 || m_poseUser == user.getId())
-		{
-			const nite::PoseData& pose = user.getPose(nite::POSE_CROSSED_HANDS);
-
-			if (pose.isEntered())
-			{
-				// Start timer
-				sprintf(g_generalMessage, "In exit pose. Keep it for %d second%s to exit\n", g_poseTimeoutToExit/1000, g_poseTimeoutToExit/1000 == 1 ? "" : "s");
-				m_poseUser = user.getId();
-				m_poseTime = userTrackerFrame.getTimestamp();
-			}
-			else if (pose.isExited())
-			{
-				memset(g_generalMessage, 0, sizeof(g_generalMessage));
-				m_poseTime = 0;
-				m_poseUser = 0;
-			}
-			else if (pose.isHeld())
-			{
-				// tick
-				if (userTrackerFrame.getTimestamp() - m_poseTime > g_poseTimeoutToExit * 1000)
+				if (users[i].getSkeleton().getState() == nite::SKELETON_TRACKED )
 				{
-					g_drawBackground=!g_drawBackground;
+					TrackUser(m_pUserTracker,user);
 				}
 			}
-
 		}
 	}
 
-	if (g_drawFrameId)
-	{
-		DrawFrameId(userTrackerFrame.getFrameIndex());
-	}
-/*
-	if (g_generalMessage[0] != '\0')
-	{
-		char *msg = g_generalMessage;
-		glColor3f(1.0f, 0.0f, 0.0f);
-		glRasterPos2i(100, 20);
-		glPrintString(GLUT_BITMAP_HELVETICA_18, msg);
-	}
+	/*
+		Überlagertes Bild zeichnen
 	*/
+	if(	imagePairs.size()>0 && 
+		imagePairID>=0 && 
+		imagePairID<imagePairs.size() && 
+		imageBorder>=0 && 
+		imageBorder<=GL_WIN_SIZE_X)
+	{
 
+		int w=imagePairs.at(imagePairID).overlay.width;
+
+		glEnable(GL_TEXTURE_2D);
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST); //GL_NEAREST = no smoothing
+		glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+		glTexImage2D(
+			GL_TEXTURE_2D,			//targte
+			0,						//level
+			4,						//internal format
+			w,						//breite 
+			imagePairs.at(imagePairID).overlay.height,						//hoehe
+			0,						//border
+			GL_RGBA,					//format
+			GL_UNSIGNED_BYTE,		//typ
+			&imagePairs.at(imagePairID).overlay.img[0]				//zeiger auf 1. pixel
+		);
+
+		glEnable(GL_TEXTURE_2D);
+		glBegin(GL_QUADS);
+
+			glTexCoord2f( 0.0f, 0.0f); 
+			glVertex2f( 0, 0);
+      
+			glTexCoord2f( 
+				(float)imageBorder/(float)w, 
+				0.0f); 
+			glVertex2f( 
+				imageBorder, 
+				0);
+      
+			glTexCoord2f( 
+				(float)imageBorder/(float)w, 
+				1.0f); 
+			glVertex2f( 
+				imageBorder, 
+				GL_WIN_SIZE_Y);
+      
+			glTexCoord2f( 0.0f, 1.0f); 
+			glVertex2f( 
+				0, 
+				GL_WIN_SIZE_Y);
+
+		glEnd();
+
+		glDisable(GL_TEXTURE_2D);
+	
+	}
 
 	// Swap the OpenGL display buffers
 	glutSwapBuffers();
@@ -644,41 +908,11 @@ void SampleViewer::Display()
 
 void SampleViewer::OnKey(unsigned char key, int /*x*/, int /*y*/)
 {
-	switch (key)
+	if(key==27)
 	{
-	case 27:
-		Finalize();
-		exit (1);
-	case 's':
-		// Draw skeleton?
-		g_drawSkeleton = !g_drawSkeleton;
-		break;
-	case 'l':
-		// Draw user status label?
-		g_drawStatusLabel = !g_drawStatusLabel;
-		break;
-	case 'c':
-		// Draw center of mass?
-		g_drawCenterOfMass = !g_drawCenterOfMass;
-		break;
-	case 'x':
-		// Draw bounding box?
-		g_drawBoundingBox = !g_drawBoundingBox;
-		break;
-	case 'b':
-		// Draw background?
-		g_drawBackground = !g_drawBackground;
-		break;
-	case 'd':
-		// Draw depth?
-		g_drawDepth = !g_drawDepth;
-		break;
-	case 'f':
-		// Draw frame ID
-		g_drawFrameId = !g_drawFrameId;
-		break;
+		printf("Programm was stopped by User.\n");
+		exit(1);
 	}
-
 }
 
 openni::Status SampleViewer::InitOpenGL(int argc, char **argv)
@@ -687,7 +921,8 @@ openni::Status SampleViewer::InitOpenGL(int argc, char **argv)
 	glutInitDisplayMode(GLUT_RGB | GLUT_DOUBLE | GLUT_DEPTH);
 	glutInitWindowSize(GL_WIN_SIZE_X, GL_WIN_SIZE_Y);
 	glutCreateWindow (m_strSampleName);
-	glutFullScreen();
+	if(g_fullScreen)
+		glutFullScreen();
 	glutSetCursor(GLUT_CURSOR_NONE);
 
 	InitOpenGLHooks();
